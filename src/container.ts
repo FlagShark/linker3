@@ -1,8 +1,11 @@
+import { OpenFeature, type Client } from "@openfeature/server-sdk";
+import { LaunchDarklyProvider } from "@launchdarkly/openfeature-node-server";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { init, type LDClient } from "@launchdarkly/node-server-sdk";
+import type { LDClient } from "@launchdarkly/node-server-sdk";
 import { createPool, type Pool } from "mysql2/promise";
 import { LinkService } from "./application/LinkService.ts";
 import { LinkValidator } from "./application/LinkValidator.ts";
@@ -68,7 +71,7 @@ export function createApplication(config: AppConfig, homePage?: string): Applica
   const service = new LinkService(repository, codeGenerator, validator, logger, meter);
   const controller = new LinkController(service, config.baseUrl);
   const sdkKey = process.env.LAUNCHDARKLY_SDK_KEY;
-  const ldClient = init(sdkKey ?? "", sdkKey ? undefined : { offline: true });
+  const ldClient = registerLaunchDarklyClient(new LaunchDarklyProvider(sdkKey ?? "", sdkKey ? undefined : { offline: true }));
   const mysqlPool = createPool({
     host: config.mysql.host,
     database: config.mysql.database,
@@ -87,4 +90,67 @@ export function createApplication(config: AppConfig, homePage?: string): Applica
 export function createApp(config: AppConfig, homePage?: string): App {
   const application = createApplication(config, homePage);
   return { ...application, server: createNodeHttpServer(application.router) };
+}
+
+/**
+ * Registers a LaunchDarkly provider under an OpenFeature domain of its own and
+ * returns the provider's own LaunchDarkly client, unchanged, for the code that
+ * stores, returns or passes it. Evaluations the migration rewrote reach this
+ * client's OpenFeature client through a registry keyed by it, whose entry keeps
+ * the provider alive exactly as long as the client. OpenFeature holds the provider
+ * only through a weak reference, so the client is released when the application
+ * drops it and its domain is then reused; closing and flushing the client stay
+ * the application's own. Added by the OpenFeature migration.
+ */
+function registerLaunchDarklyClient(provider: LaunchDarklyProvider): ReturnType<LaunchDarklyProvider["getClient"]> {
+  const slots = globalThis as unknown as Record<
+    symbol,
+    {
+      free: string[];
+      registry: WeakMap<object, { openFeature: Client; provider: object; reference: { deref(): object | undefined }; methods: Record<string, unknown> }>;
+      released: { register(target: object, domain: string): void };
+    } | undefined
+  >;
+  const slot = Symbol.for("flagshark.launchdarkly-openfeature");
+  let state = slots[slot];
+  if (!state) {
+    const free: string[] = [];
+    const Registry = (
+      globalThis as unknown as {
+        FinalizationRegistry: new (
+          cleanup: (domain: string) => void,
+        ) => { register(target: object, domain: string): void }
+      }
+    ).FinalizationRegistry;
+    state = { free, registry: new WeakMap(), released: new Registry((domain) => free.push(domain)) };
+    slots[slot] = state;
+  }
+  const Reference = (
+    globalThis as unknown as { WeakRef: new (target: LaunchDarklyProvider) => { deref(): LaunchDarklyProvider | undefined } }
+  ).WeakRef;
+  const reference = new Reference(provider);
+  const released = (): never => {
+    throw new Error("The LaunchDarkly provider of this OpenFeature domain was released with its client");
+  }
+  const domain = state.free.pop() ?? randomUUID();
+  OpenFeature.setProvider(domain, {
+    metadata: provider.metadata,
+    runsOn: provider.runsOn,
+    events: provider.events,
+    hooks: provider.hooks,
+    initialize: (context) => reference.deref()?.initialize(context) ?? Promise.resolve(),
+    resolveBooleanEvaluation: (flag, value, context) => (reference.deref() ?? released()).resolveBooleanEvaluation(flag, value, context),
+    resolveStringEvaluation: (flag, value, context) => (reference.deref() ?? released()).resolveStringEvaluation(flag, value, context),
+    resolveNumberEvaluation: (flag, value, context) => (reference.deref() ?? released()).resolveNumberEvaluation(flag, value, context),
+    resolveObjectEvaluation: (flag, value, context) => (reference.deref() ?? released()).resolveObjectEvaluation(flag, value, context),
+    track: (event, context, details) => reference.deref()?.track(event, context, details),
+  });
+  const client = provider.getClient();
+  const methods: Record<string, unknown> = {};
+  for (const method of ["boolVariation", "stringVariation", "numberVariation", "jsonVariation", "variation", "boolVariationDetail", "stringVariationDetail", "numberVariationDetail", "jsonVariationDetail", "variationDetail"]) {
+    methods[method] = (client as unknown as Record<string, unknown>)[method];
+  }
+  state.registry.set(client, { openFeature: OpenFeature.getClient(domain), provider, reference, methods });
+  state.released.register(client, domain);
+  return client;
 }

@@ -1,3 +1,4 @@
+import type { Client } from "@openfeature/server-sdk";
 import type { LDClient } from "@launchdarkly/node-server-sdk";
 import { AppError } from "../domain/errors.ts";
 import type { HealthChecker } from "../domain/HealthChecker.ts";
@@ -158,7 +159,7 @@ export class Router implements HttpHandler {
     // LaunchDarkly demo - safe to remove
     if (url === "/launchdarkly-demo" && method === "GET") {
       const context = { kind: "user", key: "demo-user" };
-      const enabled = await this.ldClient.boolVariation("my-first-flag", context, false);
+      const enabled = await launchDarklyEvaluation(this.ldClient, "boolVariation", (client) => client.getBooleanValue("my-first-flag", false, context), (client) => client.boolVariation("my-first-flag", context, false));
       // Deliver the evaluation event immediately instead of waiting for the
       // periodic 5s flush, so a single request reliably registers in
       // LaunchDarkly (e.g. onboarding "first event" detection).
@@ -201,4 +202,28 @@ export class Router implements HttpHandler {
 
     return this.controller.redirect(url.slice(1), res);
   }
+}
+
+/**
+ * A flag evaluation through the OpenFeature client registered for this LaunchDarkly
+ * client. A client the migration did not register (created by code it did not
+ * rewrite, or a test double), a client whose evaluation method is no longer the
+ * one it had when registered (a stub on the instance or its prototype), a provider
+ * that is no longer reachable, or an evaluation before OpenFeature reports the
+ * provider ready keeps the original LaunchDarkly call, unchanged. Added by the
+ * OpenFeature migration.
+ */
+function launchDarklyEvaluation<C, T, U>(client: C, method: string, openFeature: (client: Client) => T, launchDarkly: (client: C) => U): T | U {
+  const state = (globalThis as unknown as Record<symbol, { registry: WeakMap<object, { openFeature: Client; reference: { deref(): object | undefined }; methods: Record<string, unknown> }> } | undefined>)[Symbol.for("flagshark.launchdarkly-openfeature")];
+  const entry = typeof client === "object" && client !== null ? state?.registry.get(client) : undefined;
+  const status: string | undefined = entry?.openFeature.providerStatus;
+  if (
+    entry &&
+    entry.reference.deref() !== undefined &&
+    (status === "READY" || status === "STALE") &&
+    (client as unknown as Record<string, unknown>)[method] === entry.methods[method]
+  ) {
+    return openFeature(entry.openFeature);
+  }
+  return launchDarkly(client);
 }

@@ -1,8 +1,10 @@
+import { OpenFeature, type Client } from "@openfeature/server-sdk";
+import { LaunchDarklyProvider } from "@launchdarkly/openfeature-node-server";
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import test from "node:test";
-import { init } from "@launchdarkly/node-server-sdk";
 import { LinkService } from "../src/application/LinkService.ts";
 import type { Link } from "../src/domain/Link.ts";
 import type { LinkRepository } from "../src/domain/LinkRepository.ts";
@@ -83,7 +85,7 @@ const makeRouter = (t: { after(fn: () => void): void }, homePage = "") => {
     tracer
   );
   const controller = new LinkController(service, "https://short.test");
-  const ldClient = init("", { offline: true });
+  const ldClient = registerLaunchDarklyClient(new LaunchDarklyProvider("", { offline: true }));
   return {
     repo,
     router: new Router(controller, homePage, ldClient, undefined, tracer),
@@ -168,7 +170,7 @@ test("GET /healthz responde 200 cuando el healthChecker pasa", async (t) => {
     tracer
   );
   const controller = new LinkController(service, "https://short.test");
-  const ldClient = init("", { offline: true });
+  const ldClient = registerLaunchDarklyClient(new LaunchDarklyProvider("", { offline: true }));
   const router = new Router(controller, "", ldClient, undefined, tracer, {
     check: () => Promise.resolve(),
   });
@@ -202,7 +204,7 @@ test("GET /healthz responde 503 cuando el healthChecker falla", async (t) => {
     tracer
   );
   const controller = new LinkController(service, "https://short.test");
-  const ldClient = init("", { offline: true });
+  const ldClient = registerLaunchDarklyClient(new LaunchDarklyProvider("", { offline: true }));
   const router = new Router(controller, "", ldClient, undefined, tracer, {
     check: () => Promise.reject(new Error("conexión rechazada")),
   });
@@ -412,7 +414,7 @@ test("un error inesperado responde 500 sin filtrar detalles", async () => {
   };
   const service = new LinkService(brokenRepo, new RandomCodeGenerator());
   const controller = new LinkController(service, "https://short.test");
-  const ldClient = init("", { offline: true });
+  const ldClient = registerLaunchDarklyClient(new LaunchDarklyProvider("", { offline: true }));
   const router = new Router(controller, "", ldClient);
   const res = new FakeResponse();
 
@@ -421,3 +423,66 @@ test("un error inesperado responde 500 sin filtrar detalles", async () => {
   assert.equal(res.status, 500);
   assert.deepEqual(JSON.parse(res.body), { error: "Error interno" });
 });
+
+/**
+ * Registers a LaunchDarkly provider under an OpenFeature domain of its own and
+ * returns the provider's own LaunchDarkly client, unchanged, for the code that
+ * stores, returns or passes it. Evaluations the migration rewrote reach this
+ * client's OpenFeature client through a registry keyed by it, whose entry keeps
+ * the provider alive exactly as long as the client. OpenFeature holds the provider
+ * only through a weak reference, so the client is released when the application
+ * drops it and its domain is then reused; closing and flushing the client stay
+ * the application's own. Added by the OpenFeature migration.
+ */
+function registerLaunchDarklyClient(provider: LaunchDarklyProvider): ReturnType<LaunchDarklyProvider["getClient"]> {
+  const slots = globalThis as unknown as Record<
+    symbol,
+    {
+      free: string[];
+      registry: WeakMap<object, { openFeature: Client; provider: object; reference: { deref(): object | undefined }; methods: Record<string, unknown> }>;
+      released: { register(target: object, domain: string): void };
+    } | undefined
+  >;
+  const slot = Symbol.for("flagshark.launchdarkly-openfeature");
+  let state = slots[slot];
+  if (!state) {
+    const free: string[] = [];
+    const Registry = (
+      globalThis as unknown as {
+        FinalizationRegistry: new (
+          cleanup: (domain: string) => void,
+        ) => { register(target: object, domain: string): void }
+      }
+    ).FinalizationRegistry;
+    state = { free, registry: new WeakMap(), released: new Registry((domain) => free.push(domain)) };
+    slots[slot] = state;
+  }
+  const Reference = (
+    globalThis as unknown as { WeakRef: new (target: LaunchDarklyProvider) => { deref(): LaunchDarklyProvider | undefined } }
+  ).WeakRef;
+  const reference = new Reference(provider);
+  const released = (): never => {
+    throw new Error("The LaunchDarkly provider of this OpenFeature domain was released with its client");
+  }
+  const domain = state.free.pop() ?? randomUUID();
+  OpenFeature.setProvider(domain, {
+    metadata: provider.metadata,
+    runsOn: provider.runsOn,
+    events: provider.events,
+    hooks: provider.hooks,
+    initialize: (context) => reference.deref()?.initialize(context) ?? Promise.resolve(),
+    resolveBooleanEvaluation: (flag, value, context) => (reference.deref() ?? released()).resolveBooleanEvaluation(flag, value, context),
+    resolveStringEvaluation: (flag, value, context) => (reference.deref() ?? released()).resolveStringEvaluation(flag, value, context),
+    resolveNumberEvaluation: (flag, value, context) => (reference.deref() ?? released()).resolveNumberEvaluation(flag, value, context),
+    resolveObjectEvaluation: (flag, value, context) => (reference.deref() ?? released()).resolveObjectEvaluation(flag, value, context),
+    track: (event, context, details) => reference.deref()?.track(event, context, details),
+  });
+  const client = provider.getClient();
+  const methods: Record<string, unknown> = {};
+  for (const method of ["boolVariation", "stringVariation", "numberVariation", "jsonVariation", "variation", "boolVariationDetail", "stringVariationDetail", "numberVariationDetail", "jsonVariationDetail", "variationDetail"]) {
+    methods[method] = (client as unknown as Record<string, unknown>)[method];
+  }
+  state.registry.set(client, { openFeature: OpenFeature.getClient(domain), provider, reference, methods });
+  state.released.register(client, domain);
+  return client;
+}
